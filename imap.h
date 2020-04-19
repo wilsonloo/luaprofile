@@ -19,4 +19,6 @@ void* imap_query(struct imap_context* imap, uint64_t key);
 typedef void(*observer)(uint64_t key, void* value, void* ud);
 void imap_dump(struct imap_context* imap, observer observer_cb, void* ud);
 
+size_t imap_size(struct imap_context* imap);
+
 #endif

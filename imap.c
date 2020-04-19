@@ -185,3 +185,8 @@ imap_dump(struct imap_context* imap, observer observer_cb, void* ud) {
         }
     }
 }
+
+size_t
+imap_size(struct imap_context* imap) {
+    return imap->count;
+}
