@@ -1,10 +1,6 @@
 #include "imap.h"
 #include "profile.h"
 
-#include <stdio.h>
-#include <string.h>
-#include <assert.h>
-
 enum imap_status {
     IS_NONE,
     IS_EXIST,
