@@ -1,6 +1,6 @@
 #include "profile.h"
 #include "imap.h"
-#include "icalltree.h"
+#include "icallpath.h"
 
 #include "lobject.h"
 #include "lstate.h"
@@ -10,7 +10,7 @@
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
 
-static const char KEY = 'k';
+#define KEY "swt_profiler"
 
 
 #ifdef USE_RDTSC
@@ -50,45 +50,50 @@ struct call_frame {
     const void* point;
     const void* prototype;
     bool  tail;
-    uint64_t record_time;
     uint64_t call_time;
     uint64_t ret_time;
     uint64_t sub_cost;
     uint64_t real_cost;
-    uint64_t alloc_count;
+    uint64_t alloc_co_cost;
+    uint64_t alloc_start;
 };
 
 struct call_state {
     lua_State*  co;
     uint64_t    leave_time;
+    uint64_t    leave_alloc;
     int         top;
     struct call_frame   call_list[0];
 };
 
 struct profile_context {
-    uint64_t start;
-    struct imap_context* cs_map;
-    struct icalltree_context* calltree;
-    struct call_state* cur_cs;
+    uint64_t    start;
+    bool        increment_alloc_count;
+    uint64_t    alloc_count;
+    lua_Alloc   last_alloc_f;
+    void*       last_alloc_ud;
+    struct imap_context*        cs_map;
+    struct icallpath_context*   callpath;
+    struct call_state*          cur_cs;
 };
 
-struct calltree_node {
-    struct calltree_node* parent;
+struct callpath_node {
+    struct callpath_node*   parent;
     const void* point;
     const char* source;
     const char* name;
-    char flag;
-    int line;
-    int depth;
+    int     line;
+    int     depth;
     uint64_t ret_time;
     uint64_t count;
     uint64_t record_time;
     uint64_t alloc_count;
 };
 
-static struct calltree_node* 
-calltree_node_create() {
-    struct calltree_node* node = (struct calltree_node*)pmalloc(sizeof(*node));
+static struct callpath_node*
+callpath_node_create() {
+    struct callpath_node* node = (struct callpath_node*)pmalloc(sizeof(*node));
+    node->parent = NULL;
     node->point = NULL;
     node->source = NULL;
     node->name = NULL;
@@ -97,9 +102,7 @@ calltree_node_create() {
     node->ret_time = 0;
     node->count = 0;
     node->record_time = 0;
-    node->parent = NULL;
     node->alloc_count = 0;
-    node->flag = '\0';
     return node;
 }
 
@@ -110,8 +113,12 @@ profile_create() {
     
     context->start = 0;
     context->cs_map = imap_create();
-    context->calltree = NULL;
+    context->callpath = NULL;
     context->cur_cs = NULL;
+    context->increment_alloc_count = false;
+    context->alloc_count = 0;
+    context->last_alloc_f = NULL;
+    context->last_alloc_ud = NULL;
     return context;
 }
 
@@ -121,9 +128,9 @@ _ob_free_call_state(uint64_t key, void* value, void* ud) {
 }
 static void
 profile_free(struct profile_context* context) {
-    if (context->calltree) {
-        icalltree_free(context->calltree);
-        context->calltree = NULL;
+    if (context->callpath) {
+        icallpath_free(context->callpath);
+        context->callpath = NULL;
     }
 
     imap_dump(context->cs_map, _ob_free_call_state, NULL);
@@ -161,45 +168,45 @@ cur_callframe(struct call_state* cs) {
 
 static inline struct profile_context *
 _get_profile(lua_State* L) {
-    lua_rawgetp(L, LUA_REGISTRYINDEX, (void *)&KEY);
+    lua_rawgetp(L, LUA_REGISTRYINDEX, KEY);
     struct profile_context* addr = (struct profile_context*)lua_touserdata(L, -1);
     lua_pop(L, 1);
     return addr;
 }
 
-static struct icalltree_context* 
+static struct icallpath_context*
 get_frame_path(struct profile_context* context, struct call_state* cs, lua_Debug* far) {
-    if (!context->calltree) {
-        struct calltree_node* node = calltree_node_create();
+    if (!context->callpath) {
+        struct callpath_node* node = callpath_node_create();
         node->name = "total";
         node->source = node->name;
-        context->calltree = icalltree_create(0, node);
+        context->callpath = icallpath_create(0, node);
     }
-    struct icalltree_context* path = context->calltree;
+    struct icallpath_context* path = context->callpath;
 
     int i = 0;
     for (i = 0; i < cs->top; i++) {
         struct call_frame* cur_cf = &(cs->call_list[i]);
         uint64_t k = (uint64_t)((uintptr_t)cur_cf->prototype);
-        struct icalltree_context* child_path = icalltree_get_child(path, k);
+        struct icallpath_context* child_path = icallpath_get_child(path, k);
         if (!child_path) {
-            struct calltree_node* path_parent = (struct calltree_node*)icalltree_getvalue(path);
-            struct calltree_node* node = calltree_node_create();
+            struct callpath_node* path_parent = (struct callpath_node*)icallpath_getvalue(path);
+            struct callpath_node* node = callpath_node_create();
 
-            node->point = cur_cf->prototype;
             node->parent = path_parent;
+            node->point = cur_cf->prototype;
             node->depth = path_parent->depth + 1;
             node->ret_time = 0;
             node->record_time = 0;
             node->count = 0;
             node->alloc_count = 0;
-            child_path = icalltree_add_child(path, k, node);
+            child_path = icallpath_add_child(path, k, node);
         }
 
         path = child_path;
     }
     
-    struct calltree_node* cur_node = (struct calltree_node*)icalltree_getvalue(path);
+    struct callpath_node* cur_node = (struct callpath_node*)icallpath_getvalue(path);
     if (cur_node->name == NULL) {
         const char* name = NULL;
         #ifdef USE_EXPORT_NAME
@@ -233,10 +240,20 @@ get_frame_path(struct profile_context* context, struct call_state* cs, lua_Debug
         cur_node->name = name ? name : "null";
         cur_node->source = source ? source : "null";
         cur_node->line = line;
-        cur_node->flag = flag;
     }
     
     return path;
+}
+
+static void*
+_resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    struct profile_context* context = (struct profile_context*)ud;
+    size_t old = ptr == NULL ? 0 : osize;
+    if (nsize > 0 && nsize > old && context->increment_alloc_count) {
+        context->alloc_count += (nsize - old);
+    }
+
+    return context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
 }
 
 static void
@@ -247,6 +264,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         return;
     }
 
+    context->increment_alloc_count = false;
     int event = far->event;
     struct call_state* cs = context->cur_cs;
     if (!context->cur_cs || context->cur_cs->co != L) {
@@ -257,23 +275,28 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
             cs->co = L;
             cs->top = 0;
             cs->leave_time = 0;
+            cs->leave_alloc = 0;
             imap_set(context->cs_map, key, cs);
         }
 
         if (context->cur_cs) {
             context->cur_cs->leave_time = cur_time;
+            context->cur_cs->leave_alloc = context->alloc_count;
         }
         context->cur_cs = cs;
     }
     if (cs->leave_time > 0) {
         assert(cur_time >= cs->leave_time);
         uint64_t co_cost = cur_time - cs->leave_time;
+        uint64_t co_alloc = context->alloc_count - cs->leave_alloc;
 
         int i = 0;
         for (; i < cs->top; i++) {
             cs->call_list[i].sub_cost += co_cost;
+            cs->call_list[i].alloc_co_cost += co_alloc;
         }
         cs->leave_time = 0;
+        cs->leave_alloc = 0;
     }
     assert(cs->co == L);
 
@@ -284,9 +307,10 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         struct call_frame* frame = push_callframe(cs);
         frame->point = point;
         frame->tail = event == LUA_HOOKTAILCALL;
-        frame->record_time = cur_time;
         frame->sub_cost = 0;
         frame->call_time = gettime();
+        frame->alloc_co_cost = 0;
+        frame->alloc_start = context->alloc_count;
 
         frame->prototype = point;
         if (far->i_ci && ttisclosure(far->i_ci->func)) {
@@ -298,15 +322,18 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
     } else if (event == LUA_HOOKRET) {
         int len = cs->top;
         if(len <= 0) {
+            context->increment_alloc_count = true;
             return;
         }
         bool tail_call = false;
         do {
-            struct calltree_node* cur_path = (struct calltree_node*)icalltree_getvalue(get_frame_path(context, cs, far));
+            struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(get_frame_path(context, cs, far));
 
             struct call_frame* cur_frame = pop_callframe(cs);
             uint64_t total_cost = cur_time - cur_frame->call_time;
             uint64_t real_cost = total_cost - cur_frame->sub_cost;
+            uint64_t alloc_count = context->alloc_count - cur_frame->alloc_start - cur_frame->alloc_co_cost;
+            assert(context->alloc_count >= (cur_frame->alloc_start + cur_frame->alloc_co_cost));
             assert(cur_time >= cur_frame->call_time && total_cost >= cur_frame->sub_cost);
             cur_frame->ret_time = cur_time;
             cur_frame->real_cost = real_cost;
@@ -314,11 +341,14 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
             cur_path->ret_time = cur_path->ret_time == 0 ? cur_time : cur_path->ret_time;
             cur_path->record_time += real_cost;
             cur_path->count++;
+            cur_path->alloc_count += alloc_count;
 
             struct call_frame* pre_frame = cur_callframe(cs);
             tail_call = pre_frame ? cur_frame->tail : false;
         }while(tail_call);
     }
+
+    context->increment_alloc_count = true;
 }
 
 
@@ -327,15 +357,16 @@ struct dump_call_path_arg {
     uint64_t record_time;
     uint64_t count;
     uint64_t index;
+    uint64_t alloc_count;
 };
 
-static void _dump_call_path(struct icalltree_context* path, struct dump_call_path_arg* arg);
+static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg);
 static void _dump_call_path_child(uint64_t key, void* value, void* ud) {
     struct dump_call_path_arg* arg = (struct dump_call_path_arg*)ud;
-    _dump_call_path((struct icalltree_context*)value, arg);
+    _dump_call_path((struct icallpath_context*)value, arg);
     lua_seti(arg->L, -2, ++arg->index);
 }
-static void _dump_call_path(struct icalltree_context* path, struct dump_call_path_arg* arg) {
+static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg) {
     lua_checkstack(arg->L, 3);
     lua_newtable(arg->L);
 
@@ -344,20 +375,23 @@ static void _dump_call_path(struct icalltree_context* path, struct dump_call_pat
     child_arg.record_time = 0;
     child_arg.count = 0;
     child_arg.index = 0;
+    child_arg.alloc_count = 0;
 
-    if (icalltree_children_size(path) > 0) {
+    if (icallpath_children_size(path) > 0) {
         lua_newtable(arg->L);
-        icalltree_dump_children(path, _dump_call_path_child, &child_arg);
+        icallpath_dump_children(path, _dump_call_path_child, &child_arg);
         lua_setfield(arg->L, -2, "children");
     }
 
-    struct calltree_node* node = (struct calltree_node*)icalltree_getvalue(path);
+    struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
+    uint64_t alloc_count = node->alloc_count > child_arg.alloc_count ? node->alloc_count : child_arg.alloc_count;
     uint64_t count = node->count > child_arg.count ? node->count : child_arg.count;
     uint64_t rt = realtime(node->record_time) * MICROSEC;
     uint64_t record_time = rt > child_arg.record_time ? rt : child_arg.record_time;
 
     arg->record_time += record_time;
     arg->count += count;
+    arg->alloc_count += alloc_count;
 
     char name[512] = {0};
     snprintf(name, sizeof(name)-1, "%s %s:%d", node->name ? node->name : "", node->source ? node->source : "", node->line);
@@ -372,13 +406,17 @@ static void _dump_call_path(struct icalltree_context* path, struct dump_call_pat
 
     lua_pushinteger(arg->L, node->ret_time);
     lua_setfield(arg->L, -2, "rettime");
+
+    lua_pushinteger(arg->L, alloc_count);
+    lua_setfield(arg->L, -2, "alloc_count");
 }
-static void dump_call_path(lua_State* L, struct icalltree_context* path) {
+static void dump_call_path(lua_State* L, struct icallpath_context* path) {
     struct dump_call_path_arg arg;
     arg.L = L;
     arg.record_time = 0;
     arg.count = 0;
     arg.index = 0;
+    arg.alloc_count = 0;
     _dump_call_path(path, &arg);
 }
 
@@ -409,14 +447,17 @@ _lstart(lua_State* L) {
     // init registry
     context = profile_create();
     lua_pushlightuserdata(L, context);
-    lua_rawsetp(L, LUA_REGISTRYINDEX, (void *)&KEY);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, KEY);
     context->start = gettime();
+    context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
+    lua_setallocf(L, _resolve_alloc, (void*)context);
 
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
     for (i = i - 1; i >= 0; i--) {
         lua_sethook(states[i], _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
     }
+    context->increment_alloc_count = true;
     return 0;
 }
 
@@ -426,6 +467,14 @@ _lstop(lua_State* L) {
     if (!context) {
         return 0;
     }
+    context->increment_alloc_count = false;
+
+    void* current_ud = NULL;
+    lua_getallocf(L, &current_ud);
+    if (current_ud == context) {
+        lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
+    }
+
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
     for (i = i - 1; i >= 0; i--) {
@@ -433,7 +482,7 @@ _lstop(lua_State* L) {
     }
     profile_free(context);
 
-    lua_pushlightuserdata(L, (void *)&KEY);
+    lua_pushlightuserdata(L, KEY);
     lua_pushnil(L);
     lua_settable(L, LUA_REGISTRYINDEX);
     return 0;
@@ -473,10 +522,12 @@ _lunmark(lua_State* L) {
 static int
 _ldump(lua_State* L) {
     struct profile_context* context = _get_profile(L);
-    if (context && context->calltree) {
+    if (context && context->callpath) {
+        context->increment_alloc_count = false;
         uint64_t record_time = realtime(gettime() - context->start) * MICROSEC;
         lua_pushinteger(L, record_time);
-        dump_call_path(L, context->calltree);
+        dump_call_path(L, context->callpath);
+        context->increment_alloc_count = true;
         return 2;
     }
     return 0;
