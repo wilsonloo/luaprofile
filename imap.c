@@ -21,7 +21,7 @@ struct imap_context {
     struct imap_slot* lastfree;
 };
 
-#define DEFAULT_IMAP_SLOT_SIZE  8
+#define DEFAULT_IMAP_SLOT_SIZE  1024
 
 struct imap_context *
 imap_create() {

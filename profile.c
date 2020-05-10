@@ -1,9 +1,11 @@
 #include "profile.h"
 #include "imap.h"
 #include "icallpath.h"
-
 #include "lobject.h"
 #include "lstate.h"
+#include <pthread.h>
+
+// #include <google/profiler.h>
 
 #define MAX_CALL_SIZE               1024
 #define MAX_CO_SIZE                 1024
@@ -11,7 +13,6 @@
 #define MICROSEC                    1000000
 
 #define KEY "swt_profiler"
-
 
 #ifdef USE_RDTSC
     #include "rdtsc.h"
@@ -45,10 +46,11 @@
 #endif
 
 
-
+struct callpath_node;
 struct call_frame {
     const void* point;
     const void* prototype;
+    struct icallpath_context*   path;
     bool  tail;
     uint64_t call_time;
     uint64_t ret_time;
@@ -106,6 +108,32 @@ callpath_node_create() {
     return node;
 }
 
+uint64_t g_context_ver = 0;
+pthread_once_t g_cache_init;
+pthread_key_t g_cache_ver;
+pthread_key_t g_cache_co;
+pthread_key_t g_cache_context;
+void cache_init() {
+    pthread_key_create(&g_cache_ver, NULL);
+    pthread_key_create(&g_cache_co, NULL);
+    pthread_key_create(&g_cache_context, NULL);
+}
+static struct profile_context* get_cache_context(lua_State* L) {
+    uint64_t v = (uint64_t)((uintptr_t)pthread_getspecific(g_cache_ver));
+    if (v != g_context_ver) {
+        return NULL;
+    }
+    lua_State* co = (lua_State*)pthread_getspecific(g_cache_co);
+    if (co != L) {
+        return NULL;
+    }
+    return (struct profile_context*)pthread_getspecific(g_cache_context);
+}
+void set_cache_context(lua_State* co, struct profile_context* context) {
+    pthread_setspecific(g_cache_ver, (const void*)g_context_ver);
+    pthread_setspecific(g_cache_co, (const void*)co);
+    pthread_setspecific(g_cache_context, (const void*)context);
+}
 
 static struct profile_context *
 profile_create() {
@@ -119,6 +147,7 @@ profile_create() {
     context->alloc_count = 0;
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
+    g_context_ver++;
     return context;
 }
 
@@ -128,6 +157,7 @@ _ob_free_call_state(uint64_t key, void* value, void* ud) {
 }
 static void
 profile_free(struct profile_context* context) {
+    g_context_ver++;
     if (context->callpath) {
         icallpath_free(context->callpath);
         context->callpath = NULL;
@@ -168,52 +198,58 @@ cur_callframe(struct call_state* cs) {
 
 static inline struct profile_context *
 _get_profile(lua_State* L) {
+    struct profile_context* addr = get_cache_context(L);
+    if (addr) {
+        return addr;
+    }
     lua_rawgetp(L, LUA_REGISTRYINDEX, KEY);
-    struct profile_context* addr = (struct profile_context*)lua_touserdata(L, -1);
+    addr = (struct profile_context*)lua_touserdata(L, -1);
     lua_pop(L, 1);
+    if (addr) {
+        set_cache_context(L, addr);
+    }
     return addr;
 }
 
 static struct icallpath_context*
-get_frame_path(struct profile_context* context, struct call_state* cs, lua_Debug* far) {
+get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, struct icallpath_context* pre_callpath, struct call_frame* frame) {
     if (!context->callpath) {
         struct callpath_node* node = callpath_node_create();
         node->name = "total";
         node->source = node->name;
         context->callpath = icallpath_create(0, node);
     }
-    struct icallpath_context* path = context->callpath;
-
-    int i = 0;
-    for (i = 0; i < cs->top; i++) {
-        struct call_frame* cur_cf = &(cs->call_list[i]);
-        uint64_t k = (uint64_t)((uintptr_t)cur_cf->prototype);
-        struct icallpath_context* child_path = icallpath_get_child(path, k);
-        if (!child_path) {
-            struct callpath_node* path_parent = (struct callpath_node*)icallpath_getvalue(path);
-            struct callpath_node* node = callpath_node_create();
-
-            node->parent = path_parent;
-            node->point = cur_cf->prototype;
-            node->depth = path_parent->depth + 1;
-            node->ret_time = 0;
-            node->record_time = 0;
-            node->count = 0;
-            node->alloc_count = 0;
-            child_path = icallpath_add_child(path, k, node);
-        }
-
-        path = child_path;
+    struct icallpath_context* path = pre_callpath;
+    if (!path) {
+        path = context->callpath;
     }
-    
+
+    struct call_frame* cur_cf = frame;
+    uint64_t k = (uint64_t)((uintptr_t)cur_cf->prototype);
+    struct icallpath_context* child_path = icallpath_get_child(path, k);
+    if (!child_path) {
+        struct callpath_node* path_parent = (struct callpath_node*)icallpath_getvalue(path);
+        struct callpath_node* node = callpath_node_create();
+
+        node->parent = path_parent;
+        node->point = cur_cf->prototype;
+        node->depth = path_parent->depth + 1;
+        node->ret_time = 0;
+        node->record_time = 0;
+        node->count = 0;
+        node->alloc_count = 0;
+        child_path = icallpath_add_child(path, k, node);
+    }
+    path = child_path;
+
     struct callpath_node* cur_node = (struct callpath_node*)icallpath_getvalue(path);
     if (cur_node->name == NULL) {
         const char* name = NULL;
         #ifdef USE_EXPORT_NAME
-            lua_getinfo(cs->co, "nSl", far);
+            lua_getinfo(co, "nSl", far);
             name = far->name;
         #else
-            lua_getinfo(cs->co, "Sl", far);
+            lua_getinfo(co, "Sl", far);
         #endif
         int line = far->linedefined;
         const char* source = far->source;
@@ -224,10 +260,10 @@ get_frame_path(struct profile_context* context, struct call_state* cs, lua_Debug
             int ret = 0;
             do {
                 i++;
-                ret = lua_getstack(cs->co, i, &ar2);
+                ret = lua_getstack(co, i, &ar2);
                 flag = 'C';
                 if(ret) {
-                    lua_getinfo(cs->co, "Sl", &ar2);
+                    lua_getinfo(co, "Sl", &ar2);
                     if(ar2.what[0] != 'C') {
                         line = ar2.currentline;
                         source = ar2.source;
@@ -258,12 +294,12 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
 
 static void
 _resolve_hook(lua_State* L, lua_Debug* far) {
-    uint64_t cur_time = gettime();
     struct profile_context* context = _get_profile(L);
     if(context->start == 0) {
         return;
     }
 
+    uint64_t cur_time = gettime();
     context->increment_alloc_count = false;
     int event = far->event;
     struct call_state* cs = context->cur_cs;
@@ -272,7 +308,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         cs = imap_query(context->cs_map, key);
         if (cs == NULL) {
             cs = (struct call_state*)pmalloc(sizeof(struct call_state) + sizeof(struct call_frame)*MAX_CALL_SIZE);
-            cs->co = L;
+            cs->co = L; 
             cs->top = 0;
             cs->leave_time = 0;
             cs->leave_alloc = 0;
@@ -301,17 +337,27 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
     assert(cs->co == L);
 
     if (event == LUA_HOOKCALL || event == LUA_HOOKTAILCALL) {
-        lua_getinfo(L, "f", far);
-        const void* point = lua_topointer(L, -1);
+        const void* point = NULL;
+        if (far->i_ci && far->i_ci->func) {
+            point = far->i_ci->func;
+        } else {
+            lua_getinfo(L, "f", far);
+            point = lua_topointer(L, -1);
+        }
+
+        struct icallpath_context* pre_callpath = NULL;
+        struct call_frame* pre_frame = cur_callframe(cs);
+        if (pre_frame) {
+            pre_callpath = pre_frame->path;
+        }
 
         struct call_frame* frame = push_callframe(cs);
         frame->point = point;
         frame->tail = event == LUA_HOOKTAILCALL;
         frame->sub_cost = 0;
-        frame->call_time = gettime();
+        frame->call_time = cur_time;
         frame->alloc_co_cost = 0;
         frame->alloc_start = context->alloc_count;
-
         frame->prototype = point;
         if (far->i_ci && ttisclosure(far->i_ci->func)) {
             Closure *cl = clvalue(far->i_ci->func);
@@ -319,17 +365,17 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
                 frame->prototype = cl->l.p;
             }
         }
+        frame->path = get_frame_path(context, L, far, pre_callpath, frame);
     } else if (event == LUA_HOOKRET) {
         int len = cs->top;
-        if(len <= 0) {
+        if (len <= 0) {
             context->increment_alloc_count = true;
             return;
         }
         bool tail_call = false;
         do {
-            struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(get_frame_path(context, cs, far));
-
             struct call_frame* cur_frame = pop_callframe(cs);
+            struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(cur_frame->path);
             uint64_t total_cost = cur_time - cur_frame->call_time;
             uint64_t real_cost = total_cost - cur_frame->sub_cost;
             uint64_t alloc_count = context->alloc_count - cur_frame->alloc_start - cur_frame->alloc_co_cost;
@@ -443,7 +489,7 @@ _lstart(lua_State* L) {
     if (context) {
         return 0;
     }
-
+    // ProfilerStart("my.prof");
     // init registry
     context = profile_create();
     lua_pushlightuserdata(L, context);
@@ -468,6 +514,7 @@ _lstop(lua_State* L) {
         return 0;
     }
     context->increment_alloc_count = false;
+    //ProfilerStop();
 
     void* current_ud = NULL;
     lua_getallocf(L, &current_ud);
@@ -535,6 +582,8 @@ _ldump(lua_State* L) {
 
 int
 luaopen_profile_c(lua_State* L) {
+    pthread_once(&g_cache_init, cache_init);
+
     luaL_checkversion(L);
      luaL_Reg l[] = {
         {"start", _lstart},
