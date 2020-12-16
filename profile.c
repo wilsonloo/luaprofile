@@ -289,7 +289,8 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         context->alloc_count += (nsize - old);
     }
 
-    return context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
+    void* p = context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
+    return p;
 }
 
 static void
@@ -359,9 +360,9 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         frame->alloc_co_cost = 0;
         frame->alloc_start = context->alloc_count;
         frame->prototype = point;
-        if (far->i_ci && ttisclosure(far->i_ci->func)) {
-            Closure *cl = clvalue(far->i_ci->func);
-            if (cl && cl->c.tt == LUA_TLCL) {
+        if (far->i_ci && ttisclosure(s2v(far->i_ci->func))) {
+            Closure *cl = clvalue(s2v(far->i_ci->func));
+            if (cl && cl->c.tt == LUA_VLCL) {
                 frame->prototype = cl->l.p;
             }
         }
@@ -492,6 +493,7 @@ _lstart(lua_State* L) {
     // ProfilerStart("my.prof");
     // init registry
     context = profile_create();
+
     lua_pushlightuserdata(L, context);
     lua_rawsetp(L, LUA_REGISTRYINDEX, KEY);
     context->start = gettime();
