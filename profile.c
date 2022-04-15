@@ -68,7 +68,9 @@ struct call_state {
     struct call_frame   call_list[0];
 };
 
+#define SNLUA (7 * 8)
 struct profile_context {
+    char snlua[SNLUA];
     uint64_t    start;
     bool        increment_alloc_count;
     uint64_t    alloc_count;
@@ -498,6 +500,7 @@ _lstart(lua_State* L) {
     lua_rawsetp(L, LUA_REGISTRYINDEX, KEY);
     context->start = gettime();
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
+    memcpy(context, context->last_alloc_ud, SNLUA);
     lua_setallocf(L, _resolve_alloc, (void*)context);
 
     lua_State* states[MAX_CO_SIZE] = {0};
