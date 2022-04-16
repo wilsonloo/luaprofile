@@ -12,8 +12,6 @@
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
 
-#define KEY "swt_profiler"
-
 #ifdef USE_RDTSC
     #include "rdtsc.h"
     static inline uint64_t
@@ -68,9 +66,7 @@ struct call_state {
     struct call_frame   call_list[0];
 };
 
-#define SNLUA (7 * 8)
 struct profile_context {
-    char snlua[SNLUA];
     uint64_t    start;
     bool        increment_alloc_count;
     uint64_t    alloc_count;
@@ -110,33 +106,6 @@ callpath_node_create() {
     return node;
 }
 
-uint64_t g_context_ver = 0;
-pthread_once_t g_cache_init;
-pthread_key_t g_cache_ver;
-pthread_key_t g_cache_co;
-pthread_key_t g_cache_context;
-void cache_init() {
-    pthread_key_create(&g_cache_ver, NULL);
-    pthread_key_create(&g_cache_co, NULL);
-    pthread_key_create(&g_cache_context, NULL);
-}
-static struct profile_context* get_cache_context(lua_State* L) {
-    uint64_t v = (uint64_t)((uintptr_t)pthread_getspecific(g_cache_ver));
-    if (v != g_context_ver) {
-        return NULL;
-    }
-    lua_State* co = (lua_State*)pthread_getspecific(g_cache_co);
-    if (co != L) {
-        return NULL;
-    }
-    return (struct profile_context*)pthread_getspecific(g_cache_context);
-}
-void set_cache_context(lua_State* co, struct profile_context* context) {
-    pthread_setspecific(g_cache_ver, (const void*)g_context_ver);
-    pthread_setspecific(g_cache_co, (const void*)co);
-    pthread_setspecific(g_cache_context, (const void*)context);
-}
-
 static struct profile_context *
 profile_create() {
     struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
@@ -149,7 +118,6 @@ profile_create() {
     context->alloc_count = 0;
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
-    g_context_ver++;
     return context;
 }
 
@@ -159,7 +127,6 @@ _ob_free_call_state(uint64_t key, void* value, void* ud) {
 }
 static void
 profile_free(struct profile_context* context) {
-    g_context_ver++;
     if (context->callpath) {
         icallpath_free(context->callpath);
         context->callpath = NULL;
@@ -197,20 +164,15 @@ cur_callframe(struct call_state* cs) {
     return &cs->call_list[idx];
 }
 
+struct snlua {
+    struct profile_context * context;
+};
 
 static inline struct profile_context *
 _get_profile(lua_State* L) {
-    struct profile_context* addr = get_cache_context(L);
-    if (addr) {
-        return addr;
-    }
-    lua_rawgetp(L, LUA_REGISTRYINDEX, KEY);
-    addr = (struct profile_context*)lua_touserdata(L, -1);
-    lua_pop(L, 1);
-    if (addr) {
-        set_cache_context(L, addr);
-    }
-    return addr;
+    void *ud = NULL;
+    lua_getallocf(L, &ud);
+    return ((struct snlua*)(ud))->context;
 }
 
 static struct icallpath_context*
@@ -285,7 +247,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
 
 static void*
 _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
-    struct profile_context* context = (struct profile_context*)ud;
+    struct profile_context* context = ((struct snlua*)ud)->context;
     size_t old = ptr == NULL ? 0 : osize;
     if (nsize > 0 && nsize > old && context->increment_alloc_count) {
         context->alloc_count += (nsize - old);
@@ -496,12 +458,10 @@ _lstart(lua_State* L) {
     // init registry
     context = profile_create();
 
-    lua_pushlightuserdata(L, context);
-    lua_rawsetp(L, LUA_REGISTRYINDEX, KEY);
     context->start = gettime();
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
-    memcpy(context, context->last_alloc_ud, SNLUA);
-    lua_setallocf(L, _resolve_alloc, (void*)context);
+    ((struct snlua*)(context->last_alloc_ud))->context = context;
+    lua_setallocf(L, _resolve_alloc, context->last_alloc_ud);
 
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
@@ -523,9 +483,8 @@ _lstop(lua_State* L) {
 
     void* current_ud = NULL;
     lua_getallocf(L, &current_ud);
-    if (current_ud == context) {
-        lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
-    }
+     ((struct snlua*)(current_ud))->context = NULL;
+    lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
 
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
@@ -533,10 +492,6 @@ _lstop(lua_State* L) {
         lua_sethook(states[i], NULL, 0, 0);
     }
     profile_free(context);
-
-    lua_pushlightuserdata(L, KEY);
-    lua_pushnil(L);
-    lua_settable(L, LUA_REGISTRYINDEX);
     return 0;
 }
 
@@ -587,8 +542,6 @@ _ldump(lua_State* L) {
 
 int
 luaopen_profile_c(lua_State* L) {
-    pthread_once(&g_cache_init, cache_init);
-
     luaL_checkversion(L);
      luaL_Reg l[] = {
         {"start", _lstart},
