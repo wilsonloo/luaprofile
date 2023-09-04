@@ -303,8 +303,8 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
 
     if (event == LUA_HOOKCALL || event == LUA_HOOKTAILCALL) {
         const void* point = NULL;
-        if (far->i_ci && far->i_ci->func) {
-            point = far->i_ci->func;
+        if (far->i_ci && far->i_ci->func.p) {
+            point = far->i_ci->func.p;
         } else {
             lua_getinfo(L, "f", far);
             point = lua_topointer(L, -1);
@@ -324,8 +324,8 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         frame->alloc_co_cost = 0;
         frame->alloc_start = context->alloc_count;
         frame->prototype = point;
-        if (far->i_ci && ttisclosure(s2v(far->i_ci->func))) {
-            Closure *cl = clvalue(s2v(far->i_ci->func));
+        if (far->i_ci && ttisclosure(s2v(far->i_ci->func.p))) {
+            Closure *cl = clvalue(s2v(far->i_ci->func.p));
             if (cl && cl->c.tt == LUA_VLCL) {
                 frame->prototype = cl->l.p;
             }
